@@ -17,6 +17,7 @@ import os
 import tempfile
 import shutil
 import subprocess
+import time
 
 try:
     from cv2.typing import MatLike
@@ -28,6 +29,96 @@ def load_lama_model(device):
     """Load checksum-verified LaMA weights using the standalone adapter."""
     logger.info("Loading LaMA (verifying cached weights or downloading if missing)")
     return LamaInpaint(device)
+
+
+def _format_progress_bytes(value):
+    """Format model-download byte counts for terminal progress output."""
+    units = ("B", "KB", "MB", "GB")
+    value = float(value)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+
+
+def _format_progress_eta(seconds):
+    """Format a model-download ETA for terminal progress output."""
+    if seconds <= 0 or seconds == float("inf"):
+        return "--:--"
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def make_model_progress_reporter():
+    """Create a stderr reporter for model checks and resumable downloads."""
+    state = {
+        "file": None,
+        "started_at": None,
+        "last_current": 0,
+        "last_output": 0.0,
+    }
+
+    def report(event):
+        """Print throttled model progress without corrupting preview JSON on stdout."""
+        status = event.get("status")
+        model = event.get("model", "model")
+        filename = event.get("file", "")
+
+        if status == "waiting":
+            print(f"[{model}] Waiting for another model preparation process...", file=sys.stderr, flush=True)
+            return
+        if status == "checking":
+            print(f"[{model}] Checking {filename or 'cached files'}...", file=sys.stderr, flush=True)
+            return
+        if status != "downloading":
+            print(f"[{model}] {status or 'working'}...", file=sys.stderr, flush=True)
+            return
+
+        current = int(event.get("current") or 0)
+        total = int(event.get("total") or 0)
+        now = time.monotonic()
+        if filename != state["file"] or current == 0:
+            state.update(
+                file=filename,
+                started_at=now,
+                last_current=current,
+                last_output=0.0,
+            )
+
+        if total <= 0:
+            print(
+                f"\r[{model}] {filename}: {_format_progress_bytes(current)}",
+                end="",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+
+        if now - state["last_output"] < 1.0 and current < total:
+            return
+
+        speed_start = state["last_output"] or state["started_at"]
+        elapsed = max(now - speed_start, 0.001)
+        speed = max(current - state["last_current"], 0) / elapsed
+        remaining = max(total - current, 0)
+        eta = remaining / speed if speed > 0 else float("inf")
+        print(
+            f"\r[{model}] {filename}: {_format_progress_bytes(current)}/"
+            f"{_format_progress_bytes(total)} ({current / total:.1%}) | "
+            f"{_format_progress_bytes(speed)}/s | ETA {_format_progress_eta(eta)}",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+        state["last_output"] = now
+        state["last_current"] = current
+        if current >= total:
+            print(file=sys.stderr, flush=True)
+
+    return report
 
 
 class TaskType(str, Enum):
@@ -481,11 +572,14 @@ def handle_one(image_path: Path, output_path: Path, florence_model, florence_pro
 
     # Process image
     image = Image.open(image_path).convert("RGB")
+    print("Detecting watermark with Florence-2...", flush=True)
     mask_image = get_watermark_mask(image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt)
 
     if transparent:
+        print("Making detected regions transparent...", flush=True)
         result_image = make_region_transparent(image, mask_image)
     else:
+        print("Reconstructing detected regions with LaMa...", flush=True)
         lama_result = process_image_with_lama(np.array(image), np.array(mask_image), model_manager)
         result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
 
@@ -508,6 +602,7 @@ def handle_one(image_path: Path, output_path: Path, florence_model, florence_pro
         output_format = "PNG"
 
     new_output_path = output_path.with_suffix(f".{output_format.lower()}")
+    print(f"Saving result to {new_output_path}...", flush=True)
     result_image.save(new_output_path, format=output_format)
     # Report progress for this image (end of range)
     final_progress = progress_offset + progress_scale
@@ -551,11 +646,14 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
         # Apply float32 for CPU (compatibility)
         model_dtype = torch.float32 if device == "cpu" else None
 
-        florence_path = str(ensure_florence())
+        print("Preparing Florence-2 model...", file=sys.stderr, flush=True)
+        florence_path = str(ensure_florence(progress=make_model_progress_reporter()))
+        print("Loading Florence-2 into memory...", file=sys.stderr, flush=True)
         florence_model = Florence2ForConditionalGeneration.from_pretrained(
             florence_path,
             torch_dtype=model_dtype).to(device).eval()
         florence_processor = AutoProcessor.from_pretrained(florence_path)
+        print("Florence-2 loaded.", file=sys.stderr, flush=True)
 
         # Get sample image from input
         if input_path.is_dir():
@@ -630,7 +728,9 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
     # Apply float32 for CPU (compatibility)
     model_dtype = torch.float32 if device == "cpu" else None
 
-    florence_path = str(ensure_florence())
+    print("Preparing Florence-2 model...", file=sys.stderr, flush=True)
+    florence_path = str(ensure_florence(progress=make_model_progress_reporter()))
+    print("Loading Florence-2 into memory...", file=sys.stderr, flush=True)
     florence_model = Florence2ForConditionalGeneration.from_pretrained(
         florence_path,
         torch_dtype=model_dtype).to(device).eval()
@@ -660,6 +760,7 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
             progress_scale = int(100 / total_files)
             handle_one(file_path, output_file, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt, detection_skip, fade_in, fade_out, progress_offset, progress_scale)
     else:
+        print(f"Processing: {input_path}", flush=True)
         # Single file mode - if output is a directory, construct file path
         if output_path.is_dir():
             output_file = output_path / input_path.name
