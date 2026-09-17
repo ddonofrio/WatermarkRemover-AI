@@ -61,3 +61,6 @@ huggingface/
 
 node_modules/
 build-downloads/
+
+# Bulk auto-processing workspace
+images/
